@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-# [加速黑科技] 引入混合精度训练
 from torch.cuda.amp import autocast, GradScaler 
 import pandas as pd
 import numpy as np
@@ -13,11 +12,10 @@ from sklearn.metrics import (accuracy_score, f1_score, matthews_corrcoef,
                              precision_score, recall_score, roc_auc_score, 
                              auc, precision_recall_curve)
 
-# ================= 1. 全局配置 (HPC 优化版) =================
+
 class Config:
-    # 确保路径指向你生成的 V3 数据集
+
     DATA_PATH = "RiboMotif_Training_Set_V3.tsv" 
-    # 输出文件夹 (与双塔模型区分开)
     OUTPUT_DIR = "training_logs_seq_only"
     
     MAX_LEN = 80       
@@ -26,10 +24,8 @@ class Config:
     EMBED_DIM = 64      
     HIDDEN_DIM = 128    
     
-    # [HPC 加速配置]
-    # 1. AMP开启后显存占用降低，Batch Size 可以开大 (64 -> 128)
+
     BATCH_SIZE = 4096     
-    # 2. Linux/HPC 环境下，开启多进程读取数据 (建议 4-8)
     NUM_WORKERS = 8      
     
     LEARNING_RATE = 4e-3
@@ -39,7 +35,7 @@ class Config:
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ================= 2. 数据集类 (仅处理序列) =================
+
 class RNADataset(Dataset):
     def __init__(self, tsv_file, max_len=80, vocab=None):
         self.df = pd.read_csv(tsv_file, sep='\t')
@@ -59,10 +55,8 @@ class RNADataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        # 只返回序列和标签，忽略结构
         return self.encode_sequence(row['sequence']), self.labels[idx]
 
-# ================= 3. 模型架构 (Sequence-Only Baseline) =================
 class AttentionLayer(nn.Module):
     def __init__(self, feature_dim):
         super(AttentionLayer, self).__init__()
@@ -76,7 +70,6 @@ class RiboMotifSeqModel(nn.Module):
         super(RiboMotifSeqModel, self).__init__()
         self.embedding = nn.Embedding(len(Config.VOCAB), Config.EMBED_DIM, padding_idx=0)
         
-        # 保持与双塔模型左塔完全一致的结构，确保对比公平
         self.cnn1 = nn.Conv1d(Config.EMBED_DIM, Config.HIDDEN_DIM, kernel_size=3, padding=1)
         self.cnn2 = nn.Conv1d(Config.HIDDEN_DIM, Config.HIDDEN_DIM, kernel_size=5, padding=2)
         self.bn1 = nn.BatchNorm1d(Config.HIDDEN_DIM)
@@ -106,7 +99,6 @@ class RiboMotifSeqModel(nn.Module):
         logits = self.classifier(global_feat)
         return logits
 
-# ================= 4. 训练引擎 (AMP加速 + 全记录) =================
 
 def compute_metrics(y_true, y_probs):
     y_pred = (y_probs > 0.5).astype(int)
@@ -131,36 +123,29 @@ def run_experiment():
     if not os.path.exists(Config.OUTPUT_DIR): os.makedirs(Config.OUTPUT_DIR)
     print(f"Set up output directory: {Config.OUTPUT_DIR}")
     
-    # [加速技巧1] 开启 cuDNN Benchmark (针对固定输入长度优化卷积算法)
     torch.backends.cudnn.benchmark = True
     
-    # 1. 数据准备
     print("Loading Dataset...")
     dataset = RNADataset(Config.DATA_PATH, max_len=Config.MAX_LEN, vocab=Config.VOCAB)
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size
     train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    # [加速技巧2] pin_memory=True 加速数据传输
     train_loader = DataLoader(train_set, batch_size=Config.BATCH_SIZE, shuffle=True, 
                               num_workers=Config.NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=Config.BATCH_SIZE, shuffle=False, 
                             num_workers=Config.NUM_WORKERS, pin_memory=True)
     
-    # 2. 模型准备
     model = RiboMotifSeqModel().to(Config.DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY)
     
-    # 动态权重平衡
     pos_ratio = dataset.labels.sum() / len(dataset)
     neg_ratio = 1 - pos_ratio
     pos_weight = torch.tensor([neg_ratio / pos_ratio]).to(Config.DEVICE) 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # [加速技巧3] 初始化 AMP Scaler
     scaler = GradScaler()
 
-    # 3. 日志准备
     log_df = pd.DataFrame(columns=['Epoch', 'Train_Loss', 'Val_Loss', 'Accuracy', 'Precision', 'Recall', 'F1', 'MCC', 'AUROC', 'AUPRC', 'Time'])
     csv_path = os.path.join(Config.OUTPUT_DIR, "training_log.csv")
     
@@ -183,12 +168,10 @@ def run_experiment():
             seq, label = seq.to(Config.DEVICE), label.to(Config.DEVICE)
             optimizer.zero_grad()
             
-            # 混合精度上下文
             with autocast():
                 logits = model(seq)
                 loss = criterion(logits, label.unsqueeze(1))
             
-            # Scaler 反向传播
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -197,7 +180,6 @@ def run_experiment():
             
         avg_train_loss = train_loss / len(train_loader)
         
-        # --- Validation ---
         model.eval()
         val_loss = 0
         val_probs = []
@@ -207,7 +189,6 @@ def run_experiment():
             for seq, label in val_loader:
                 seq, label = seq.to(Config.DEVICE), label.to(Config.DEVICE)
                 
-                # 推理也可以用 autocast 加速
                 with autocast():
                     logits = model(seq)
                     v_loss = criterion(logits, label.unsqueeze(1))
@@ -248,10 +229,9 @@ def run_experiment():
             best_mcc = metrics['MCC']
             patience = 0
             
-            # 1. 保存模型权重
+
             torch.save(model.state_dict(), os.path.join(Config.OUTPUT_DIR, "best_model.pth"))
             
-            # 2. 保存预测结果 (用于反复画图)
             np.savez(os.path.join(Config.OUTPUT_DIR, "best_predictions.npz"), 
                      y_true=val_targets, y_pred=val_probs)
             
